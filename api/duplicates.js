@@ -11,9 +11,13 @@
  *
  * Modes (query string):
  *   /api/duplicates                 → the dashboard (pairs)
- *   /api/duplicates?debug=schema    → introspect the live schema (RUN FIRST)
+ *   /api/duplicates?debug=probe     → test each field against the live API and
+ *                                     report which ones work (RUN THIS FIRST if
+ *                                     the dashboard errors — introspection is
+ *                                     often disabled on the Carerix API).
+ *   /api/duplicates?debug=schema    → introspect the live schema (if enabled)
  *   /api/duplicates?debug=raw       → dump 1 candidate record
- *   /api/duplicates?min=medium|high → minimum confidence to show (default medium)
+ *   /api/duplicates?min=high|medium|low → minimum confidence to show (default high)
  *   /api/duplicates?scope=owner&ownerId=123  → limit to one owner (optional)
  *
  * Env vars: CARERIX_CLIENT_ID, CARERIX_CLIENT_SECRET, CARERIX_TOKEN_ENDPOINT
@@ -21,7 +25,7 @@
  */
 
 const CARERIX_GRAPHQL_URI = 'https://api.carerix.io/graphql/v1/graphql';
-const PAGE_SIZE = 500;
+const PAGE_SIZE = 200;
 
 /* ============================================================================
  * CONFIG — the ONLY place you edit after seeing ?debug=schema output.
@@ -63,6 +67,11 @@ const CONFIG = {
   getCity:      (c) => c.toUser?.homeCity,
   getCreated:   (c) => c.creationDate,
 };
+
+// Link to open a candidate in Carerix. {id} is replaced with the employeeID.
+// Requires the CARERIX_APP_BASE env var (e.g. https://yourcompany.carerix.com).
+// Adjust the path here if this default doesn't open the candidate record.
+const CANDIDATE_URL_PATH = '/main?searchEntityName=CREmployee&id={id}';
 
 /* ─── OAuth2 ───────────────────────────────────────────────────────────────*/
 async function getAccessToken() {
@@ -153,6 +162,63 @@ async function fetchCandidates(token, qualifier, limitPages) {
     if (limitPages && page >= limitPages) break;
   }
   return all;
+}
+
+/* ─── Field probe (discovers which fields the live API accepts) ─────────────
+ * Introspection is often disabled on the Carerix API, so we test each field
+ * with a tiny size:1 query and report which ones work. Run ?debug=probe.
+ * ==========================================================================*/
+const PROBE_SNIPPETS = [
+  // top-level guesses
+  'employeeID', 'creationDate', 'modificationDate', 'firstName', 'lastName',
+  'lastNamePrefix', 'initials', 'birthDate',
+  'emailAddress', 'businessEmailAddress', 'emailAddressPrivate', 'emailAddressBusiness',
+  'privateOrBusinessEmailAddress',
+  'mobileNumber', 'mobileNumberBusiness', 'phoneNumber', 'phoneNumberBusiness',
+  'homePostalCode', 'homeCity',
+  // nested via toUser
+  'toUser { _id }',
+  'toUser { firstName }',
+  'toUser { lastName }',
+  'toUser { lastNamePrefix }',
+  'toUser { initials }',
+  'toUser { birthDate }',
+  'toUser { emailAddress }',
+  'toUser { businessEmailAddress }',
+  'toUser { mobileNumber }',
+  'toUser { mobileNumberBusiness }',
+  'toUser { phoneNumber }',
+  'toUser { homePostalCode }',
+  'toUser { homeCity }',
+  'toUser { emailAddresses { emailAddress } }',
+];
+
+async function probeOne(token, snippet) {
+  const query = `query ($p: Pageable) { ${CONFIG.queryName}(qualifier: "deleted=0", pageable: $p) { items { _id ${snippet} } } }`;
+  try { await gql(token, query, { p: { page: 0, size: 1 } }); return { snippet, ok: true }; }
+  catch (e) { return { snippet, ok: false, error: e.message.slice(0, 220) }; }
+}
+
+async function probeAll(token) {
+  const basics = {};
+  const tryQ = async (label, query) => {
+    try { await gql(token, query, { p: { page: 0, size: 1 } }); basics[label] = 'ok'; }
+    catch (e) { basics[label] = 'ERROR: ' + e.message.slice(0, 220); }
+  };
+  await tryQ('id_only_with_qualifier', `query ($p: Pageable){ ${CONFIG.queryName}(qualifier:"deleted=0", pageable:$p){ items { _id } } }`);
+  await tryQ('id_only_no_qualifier', `query ($p: Pageable){ ${CONFIG.queryName}(pageable:$p){ items { _id } } }`);
+
+  // Probe fields with limited concurrency
+  const queue = [...PROBE_SNIPPETS];
+  const results = [];
+  const worker = async () => { while (queue.length) { results.push(await probeOne(token, queue.shift())); } };
+  await Promise.all([worker(), worker(), worker()]);
+
+  return {
+    basics,
+    validFields: results.filter((r) => r.ok).map((r) => r.snippet),
+    invalidFields: results.filter((r) => !r.ok).map((r) => ({ field: r.snippet, error: r.error })),
+  };
 }
 
 /* ─── Normalization ─────────────────────────────────────────────────────────*/
@@ -273,7 +339,7 @@ function fmtDate(s) { if (!s) return '-'; const d = new Date(s); return isNaN(d)
 function candidateLink(id) {
   const base = process.env.CARERIX_APP_BASE;
   if (!base || id == null) return null;
-  return `${base.replace(/\/$/, '')}/main?searchEntityName=CREmployee&id=${encodeURIComponent(id)}`;
+  return base.replace(/\/$/, '') + CANDIDATE_URL_PATH.replace('{id}', encodeURIComponent(id));
 }
 
 const FIELD_LABEL = { email: 'Same e-mail', phone: 'Same phone', birth: 'Same birth date', lastName: 'Same last name', firstName: 'Same first name', initials: 'Same initials', postal: 'Same postal code' };
@@ -295,6 +361,7 @@ function personCol(p, side) {
         <dt>Created</dt><dd>${fmtDate(p.created)}</dd>
         <dt>ID</dt><dd>#${esc(p.id)}</dd>
       </dl>
+      ${link ? `<a class="open" href="${esc(link)}" target="_blank" rel="noopener">Open in Carerix &#8599;</a>` : ''}
     </div>`;
 }
 
@@ -347,6 +414,7 @@ function renderDashboard(pairs, stats) {
   .tag.new { background:#dafbe1; color:#1a7f37; }
   .name { font-size:15px; font-weight:600; margin-bottom:8px; }
   .name a { color:var(--cx-accent); text-decoration:none; }
+  .open { display:inline-block; margin-top:10px; background:var(--cx-accent); color:#fff; text-decoration:none; padding:5px 12px; border-radius:6px; font-size:13px; }
   dl { margin:0; display:grid; grid-template-columns:74px 1fr; gap:4px 8px; font-size:13px; }
   dt { color:#8c959f; }
   dd { margin:0; word-break:break-word; }
@@ -354,7 +422,7 @@ function renderDashboard(pairs, stats) {
   @media print { body { background:#fff; padding:0; } .searchbar { display:none; } .pair { break-inside:avoid; } }
 </style></head><body>
   <h1>Duplicate Candidates</h1>
-  <p class="subtitle">One-on-one matches, scored by confidence &middot; oldest on the left, newest on the right</p>
+  <p class="subtitle">High-confidence one-on-one matches &middot; oldest on the left, newest on the right &middot; add <code>?min=medium</code> to the URL to also see weaker matches</p>
   <div class="summary-bar">
     <div class="stat"><div class="num">${pairs.length}</div><div class="lbl">candidate pairs</div></div>
     <div class="stat"><div class="num">${pairs.filter((p) => p.level === 'High').length}</div><div class="lbl">high confidence</div></div>
@@ -401,7 +469,8 @@ export default async function handler(req, res) {
   const debug = q('debug');
   const scope = q('scope');
   const ownerId = q('ownerId');
-  const min = (q('min') || 'medium').toLowerCase() === 'high' ? 'High' : 'Medium';
+  const minRaw = (q('min') || 'high').toLowerCase();
+  const min = minRaw === 'low' ? 'Low' : minRaw === 'medium' ? 'Medium' : 'High';
 
   try {
     const token = await getAccessToken();
@@ -409,6 +478,10 @@ export default async function handler(req, res) {
     if (debug === 'schema') {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       return res.status(200).send(JSON.stringify(await introspect(token), null, 2));
+    }
+    if (debug === 'probe') {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      return res.status(200).send(JSON.stringify(await probeAll(token), null, 2));
     }
     if (debug === 'raw') {
       const one = await fetchCandidates(token, 'deleted=0', 1);
