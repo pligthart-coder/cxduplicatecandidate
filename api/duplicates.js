@@ -21,8 +21,10 @@
  */
 
 const CARERIX_GRAPHQL_URI = 'https://api.carerix.io/graphql/v1/graphql';
-const PAGE_SIZE = 150;        // fetch candidates in pages of 150
-const MAX_CANDIDATES = 2500;  // cap how many candidates are scanned
+const PAGE_SIZE = 150;         // fetch candidates in pages of 150
+const MAX_PAIRS = 2500;        // stop once this many duplicate pairs are found
+const MAX_SCAN = 50000;        // hard safety cap on candidates scanned
+const TIME_BUDGET_MS = 50000;  // stop fetching before the serverless time limit
 
 /* ============================================================================
  * CONFIG — field names, confirmed against the live schema.
@@ -152,11 +154,11 @@ async function fetchCandidates(token, qualifier, limitPages) {
     const items = await fetchPage(token, qualifier, page);
     all = all.concat(items);
     if (items.length < PAGE_SIZE) break;
-    if (all.length >= MAX_CANDIDATES) break;
+    if (all.length >= MAX_SCAN) break;
     page++;
     if (limitPages && page >= limitPages) break;
   }
-  return all.slice(0, MAX_CANDIDATES);
+  return all.slice(0, MAX_SCAN);
 }
 
 // Best-effort total count for the progress percentage (field may not exist).
@@ -319,7 +321,8 @@ function renderResultsFragment(pairs, stats) {
   }).join('') || '<div class="empty">No likely duplicate pairs found.</div>';
 
   const notes = [];
-  if (stats.capped) notes.push(`Limited to the first ${MAX_CANDIDATES} candidates (page size ${PAGE_SIZE}).`);
+  if (stats.cappedPairs) notes.push(`Reached the limit of ${MAX_PAIRS} duplicate pairs (${stats.totalFound} found in the scanned set). Merge or archive some, then Refresh.`);
+  if (stats.timedOut) notes.push(`Stopped at the time limit after scanning ${stats.scanned} candidates — press Refresh to keep scanning, or narrow the scope.`);
   if (stats.suppressedValues || stats.suppressedBuckets) notes.push(`Ignored ${stats.suppressedValues} shared e-mail/phone value(s) and ${stats.suppressedBuckets} oversized group(s) — shared by more than ${MAX_BLOCK} candidates, treated as placeholders to avoid false matches.`);
   const note = notes.length ? `<p class="note">${notes.map(esc).join('<br>')}</p>` : '';
 
@@ -398,9 +401,12 @@ const LOADER_JS = `
   es.addEventListener('progress',function(e){
     var d=JSON.parse(e.data);
     if(d.phase==='fetch'){
+      var base;
       if(d.total){ var p=Math.min(99,Math.round(d.fetched/d.total*100)); setFill(p);
-        st.textContent=d.fetched.toLocaleString()+' / '+d.total.toLocaleString()+' kandidaten opgehaald ('+p+'%)'; }
-      else { setIndet(); st.textContent=d.fetched.toLocaleString()+' kandidaten opgehaald…'; }
+        base=d.fetched.toLocaleString()+' / '+d.total.toLocaleString()+' kandidaten ('+p+'%)'; }
+      else { setIndet(); base=d.fetched.toLocaleString()+' kandidaten opgehaald…'; }
+      if(d.pairs){ base+=' · '+d.pairs.toLocaleString()+' duplicaten gevonden'; }
+      st.textContent=base;
     } else if(d.phase==='compute'){
       if(s1)s1.className=''; if(s2)s2.className='on'; setFill(99); st.textContent='Duplicaten berekenen…';
     }
@@ -495,23 +501,32 @@ export default async function handler(req, res) {
     try {
       const token = await getAccessToken();
       const total = await detectTotal(token, qualifier);
-      const cap = Math.min(total || MAX_CANDIDATES, MAX_CANDIDATES);
-      send('progress', { phase: 'fetch', fetched: 0, total: cap });
-      let all = [], page = 0;
+      send('progress', { phase: 'fetch', fetched: 0, total, pairs: 0 });
+      let all = [], page = 0, timedOut = false, pairsCount = 0;
+      const start = Date.now();
       while (true) {
         const items = await fetchPage(token, qualifier, page);
         all = all.concat(items);
-        send('progress', { phase: 'fetch', fetched: Math.min(all.length, MAX_CANDIDATES), total: cap, page });
-        if (items.length < PAGE_SIZE) break;
-        if (all.length >= MAX_CANDIDATES) break;
+        const noMore = items.length < PAGE_SIZE;
+        // Recompute duplicates periodically (and at the end) to allow early stop
+        if (noMore || page % 10 === 9) pairsCount = findPairs(all.map(toRow), min).pairs.length;
+        send('progress', { phase: 'fetch', fetched: all.length, total, pairs: pairsCount });
+        if (noMore) break;                                   // no more candidates
+        if (pairsCount >= MAX_PAIRS) break;                  // enough duplicates found
+        if (all.length >= MAX_SCAN) break;                   // safety cap
+        if (Date.now() - start > TIME_BUDGET_MS) { timedOut = true; break; } // time budget
         page++;
       }
-      all = all.slice(0, MAX_CANDIDATES);
-      send('progress', { phase: 'compute', fetched: all.length, total: cap });
-      const rows = all.map(toRow);
-      const { pairs, suppressedValues, suppressedBuckets } = findPairs(rows, min);
-      const capped = all.length >= MAX_CANDIDATES;
-      const fragment = renderResultsFragment(pairs, { scanned: all.length, suppressedValues, suppressedBuckets, capped });
+      send('progress', { phase: 'compute', fetched: all.length, total });
+      const result = findPairs(all.map(toRow), min);
+      const cappedPairs = result.pairs.length > MAX_PAIRS;
+      const pairs = result.pairs.slice(0, MAX_PAIRS);
+      const fragment = renderResultsFragment(pairs, {
+        scanned: all.length,
+        suppressedValues: result.suppressedValues,
+        suppressedBuckets: result.suppressedBuckets,
+        cappedPairs, timedOut, totalFound: result.pairs.length,
+      });
       send('done', { fragment });
       return res.end();
     } catch (err) {
