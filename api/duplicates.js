@@ -468,8 +468,9 @@ export default async function handler(req, res) {
   const minRaw = (q('min') || 'high').toLowerCase();
   const min = minRaw === 'low' ? 'Low' : minRaw === 'medium' ? 'Medium' : 'High';
 
-  // deleted = merged/removed; anonymized = GDPR-removed. Both excluded.
-  let qualifier = 'deleted = 0 and anonymized = 0';
+  // deleted = merged/removed/archived; anonymized = GDPR-removed. Both excluded.
+  // Use "!= 1" so candidates with an empty anonymized value are kept.
+  let qualifier = 'deleted = 0 and anonymized != 1';
   if (scope === 'owner' && ownerId) qualifier += ` and ownerID = ${Number(ownerId)}`;
 
   // Debug modes → JSON
