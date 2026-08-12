@@ -1,39 +1,34 @@
 /**
- * Vercel Serverless Function — Smart Duplicate Candidate checker
+ * Vercel Serverless Function — Smart Duplicate Candidate checker (with live progress)
  *
- * Queries the Carerix GraphQL API for candidates (CREmployee) and finds likely
- * duplicate PAIRS (one-on-one) by comparing multiple fields and scoring each
- * pair with a confidence level. Each pair is shown side by side, oldest on the
- * left and newest on the right, with chips explaining WHY they match.
+ * Finds likely duplicate candidate PAIRS in Carerix by comparing multiple
+ * fields and scoring each pair with a confidence level. The page shows a LIVE
+ * progress bar while candidates stream in (Server-Sent Events), then renders
+ * the pairs — oldest on the left, newest on the right, with chips explaining
+ * why they match and an "Open in Carerix" link.
  *
- * Compared fields: e-mail(s), phone(s), birth date, last name, first name,
- *                  initials, postal code.
- *
- * Modes (query string):
- *   /api/duplicates                 → the dashboard (pairs)
- *   /api/duplicates?debug=probe     → test each field against the live API and
- *                                     report which ones work (RUN THIS FIRST if
- *                                     the dashboard errors — introspection is
- *                                     often disabled on the Carerix API).
- *   /api/duplicates?debug=schema    → introspect the live schema (if enabled)
+ * Routes:
+ *   /api/duplicates                 → loader page (shows progress, then results)
+ *   /api/duplicates?stream=1        → SSE stream (progress events + final HTML)
+ *   /api/duplicates?debug=probe     → test each field against the live API
+ *   /api/duplicates?debug=schema    → introspect the schema (if enabled)
  *   /api/duplicates?debug=raw       → dump 1 candidate record
- *   /api/duplicates?min=high|medium|low → minimum confidence to show (default high)
- *   /api/duplicates?scope=owner&ownerId=123  → limit to one owner (optional)
+ *   /api/duplicates?min=high|medium|low → minimum confidence (default high)
+ *   /api/duplicates?scope=owner&ownerId=123 → limit to one owner (optional)
  *
- * Env vars: CARERIX_CLIENT_ID, CARERIX_CLIENT_SECRET, CARERIX_TOKEN_ENDPOINT
- *           CARERIX_APP_BASE (optional) for "Open candidate" deep links.
+ * Env: CARERIX_CLIENT_ID, CARERIX_CLIENT_SECRET, CARERIX_TOKEN_ENDPOINT
+ *      CARERIX_APP_BASE (optional; defaults to the ab2pro tenant).
  */
 
 const CARERIX_GRAPHQL_URI = 'https://api.carerix.io/graphql/v1/graphql';
-const PAGE_SIZE = 200;
+const PAGE_SIZE = 150;        // fetch candidates in pages of 150
+const MAX_CANDIDATES = 2500;  // cap how many candidates are scanned
 
 /* ============================================================================
- * CONFIG — the ONLY place you edit after seeing ?debug=schema output.
+ * CONFIG — field names, confirmed against the live schema.
  * ==========================================================================*/
 const CONFIG = {
   queryName: 'crEmployeePage',
-
-  // GraphQL selection set per candidate. Edit field names to match your schema.
   itemSelection: `
     _id
     employeeID
@@ -41,37 +36,38 @@ const CONFIG = {
     firstName
     lastNamePrefix
     lastName
+    initials
+    birthDate
     emailAddress
     businessEmailAddress
-    toUser {
-      initials
-      birthDate
-      mobileNumber
-      mobileNumberBusiness
-      phoneNumber
-      homePostalCode
-      homeCity
-    }
+    mobileNumber
+    mobileNumberBusiness
+    phoneNumber
+    homePostalCode
+    homeCity
+    toStatusNode { value }
   `,
-
-  // Extractors — map a returned item to values. Adjust if you change fields.
   getId:        (c) => c.employeeID ?? c._id,
   getFirstName: (c) => c.firstName,
   getPrefix:    (c) => c.lastNamePrefix,
   getLastName:  (c) => c.lastName,
-  getInitials:  (c) => c.toUser?.initials,
+  getInitials:  (c) => c.initials,
   getEmails:    (c) => [c.emailAddress, c.businessEmailAddress],
-  getPhones:    (c) => [c.toUser?.mobileNumber, c.toUser?.mobileNumberBusiness, c.toUser?.phoneNumber],
-  getBirth:     (c) => c.toUser?.birthDate,
-  getPostal:    (c) => c.toUser?.homePostalCode,
-  getCity:      (c) => c.toUser?.homeCity,
+  getPhones:    (c) => [c.mobileNumber, c.mobileNumberBusiness, c.phoneNumber],
+  getBirth:     (c) => c.birthDate,
+  getPostal:    (c) => c.homePostalCode,
+  getCity:      (c) => c.homeCity,
+  getStatus:    (c) => c.toStatusNode?.value,
   getCreated:   (c) => c.creationDate,
 };
 
-// Link to open a candidate in Carerix. {id} is replaced with the employeeID.
-// Requires the CARERIX_APP_BASE env var (e.g. https://ab2pro.carerix.net).
-// Carerix uses hash routing: https://<company>.carerix.net/#CREmployee/<id>
+// Link to open a candidate in Carerix (hash routing). {id} = employeeID.
 const CANDIDATE_URL_PATH = '/#CREmployee/{id}';
+const APP_BASE = (process.env.CARERIX_APP_BASE || 'https://ab2pro.carerix.net').replace(/\/$/, '');
+
+// A normalized e-mail/phone shared by more than this many candidates is treated
+// as a placeholder (agency e-mail, 000.. phone) and ignored as a match signal.
+const MAX_BLOCK = 25;
 
 /* ─── OAuth2 ───────────────────────────────────────────────────────────────*/
 async function getAccessToken() {
@@ -97,8 +93,8 @@ async function gql(token, query, variables) {
   });
   const text = await res.text();
   let json;
-  try { json = JSON.parse(text); } catch { throw new Error(`Non-JSON response ${res.status}: ${text.slice(0, 500)}`); }
-  if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}: ${text.slice(0, 800)}`);
+  try { json = JSON.parse(text); } catch { throw new Error(`Non-JSON response ${res.status}: ${text.slice(0, 400)}`); }
+  if (!res.ok) throw new Error(`GraphQL HTTP ${res.status}: ${text.slice(0, 600)}`);
   if (json.errors) {
     const err = new Error(`GraphQL errors: ${json.errors.map((e) => e.message).join(' | ')}`);
     err.graphqlErrors = json.errors;
@@ -107,118 +103,73 @@ async function gql(token, query, variables) {
   return json.data;
 }
 
-/* ─── Introspection (schema discovery) ──────────────────────────────────────*/
+/* ─── Introspection & probe (diagnostics) ───────────────────────────────────*/
 async function introspect(token) {
   const query = `
     query Introspect {
       schema: __schema { queryType { fields { name } } }
       CREmployee: __type(name:"CREmployee"){ ...TF }
-      Employee:   __type(name:"Employee"){ ...TF }
-      CRCandidate:__type(name:"CRCandidate"){ ...TF }
-      CRUser:     __type(name:"CRUser"){ ...TF }
-      User:       __type(name:"User"){ ...TF }
+      CRUser: __type(name:"CRUser"){ ...TF }
+      CREmployeePage: __type(name:"CREmployeePage"){ ...TF }
     }
-    fragment TF on __Type {
-      name kind
-      fields { name type { name kind ofType { name kind ofType { name kind } } } }
-    }`;
+    fragment TF on __Type { name fields { name type { name kind ofType { name } } } }`;
   const data = await gql(token, query, {});
-  const allRoot = (data.schema?.queryType?.fields || []).map((f) => f.name);
-  const flatten = (t) => t && ({
-    name: t.name,
-    fields: (t.fields || []).map((f) => ({
-      name: f.name,
-      type: f.type?.name || f.type?.ofType?.name || f.type?.ofType?.ofType?.name || f.type?.kind,
-    })),
-  });
+  const flatten = (t) => t && ({ name: t.name, fields: (t.fields || []).map((f) => ({ name: f.name, type: f.type?.name || f.type?.ofType?.name || f.type?.kind })) });
   return {
-    employeeRootQueries: allRoot.filter((n) => /mploye|andidate|user/i.test(n)),
-    types: {
-      CREmployee: flatten(data.CREmployee),
-      Employee: flatten(data.Employee),
-      CRCandidate: flatten(data.CRCandidate),
-      CRUser: flatten(data.CRUser),
-      User: flatten(data.User),
-    },
+    employeeRootQueries: (data.schema?.queryType?.fields || []).map((f) => f.name).filter((n) => /mploye|andidate|user/i.test(n)),
+    types: { CREmployee: flatten(data.CREmployee), CRUser: flatten(data.CRUser), CREmployeePage: flatten(data.CREmployeePage) },
   };
 }
 
-/* ─── Fetch all candidates ──────────────────────────────────────────────────*/
+const PROBE_SNIPPETS = ['employeeID', 'creationDate', 'firstName', 'lastName', 'lastNamePrefix', 'initials', 'birthDate', 'emailAddress', 'businessEmailAddress', 'mobileNumber', 'phoneNumber', 'homePostalCode', 'homeCity'];
+async function probeAll(token) {
+  const one = async (snippet) => {
+    const q = `query ($p: Pageable) { ${CONFIG.queryName}(qualifier:"deleted=0", pageable:$p) { items { _id ${snippet} } } }`;
+    try { await gql(token, q, { p: { page: 0, size: 1 } }); return { snippet, ok: true }; }
+    catch (e) { return { snippet, ok: false, error: e.message.slice(0, 200) }; }
+  };
+  const results = [];
+  for (const s of PROBE_SNIPPETS) results.push(await one(s));
+  return { validFields: results.filter((r) => r.ok).map((r) => r.snippet), invalidFields: results.filter((r) => !r.ok) };
+}
+
+/* ─── Fetch ─────────────────────────────────────────────────────────────────*/
+const PAGE_QUERY = `
+  query ($qualifier: String, $pageable: Pageable) {
+    ${CONFIG.queryName}(qualifier: $qualifier, pageable: $pageable) {
+      items { ${CONFIG.itemSelection} }
+    }
+  }`;
+
+async function fetchPage(token, qualifier, page) {
+  const data = await gql(token, PAGE_QUERY, { qualifier, pageable: { page, size: PAGE_SIZE } });
+  return data?.[CONFIG.queryName]?.items || [];
+}
+
 async function fetchCandidates(token, qualifier, limitPages) {
-  const query = `
-    query ($qualifier: String, $pageable: Pageable) {
-      ${CONFIG.queryName}(qualifier: $qualifier, pageable: $pageable) {
-        items { ${CONFIG.itemSelection} }
-      }
-    }`;
-  let all = [];
-  let page = 0;
+  let all = [], page = 0;
   while (true) {
-    const data = await gql(token, query, { qualifier, pageable: { page, size: PAGE_SIZE } });
-    const items = data?.[CONFIG.queryName]?.items || [];
+    const items = await fetchPage(token, qualifier, page);
     all = all.concat(items);
     if (items.length < PAGE_SIZE) break;
+    if (all.length >= MAX_CANDIDATES) break;
     page++;
     if (limitPages && page >= limitPages) break;
   }
-  return all;
+  return all.slice(0, MAX_CANDIDATES);
 }
 
-/* ─── Field probe (discovers which fields the live API accepts) ─────────────
- * Introspection is often disabled on the Carerix API, so we test each field
- * with a tiny size:1 query and report which ones work. Run ?debug=probe.
- * ==========================================================================*/
-const PROBE_SNIPPETS = [
-  // top-level guesses
-  'employeeID', 'creationDate', 'modificationDate', 'firstName', 'lastName',
-  'lastNamePrefix', 'initials', 'birthDate',
-  'emailAddress', 'businessEmailAddress', 'emailAddressPrivate', 'emailAddressBusiness',
-  'privateOrBusinessEmailAddress',
-  'mobileNumber', 'mobileNumberBusiness', 'phoneNumber', 'phoneNumberBusiness',
-  'homePostalCode', 'homeCity',
-  // nested via toUser
-  'toUser { _id }',
-  'toUser { firstName }',
-  'toUser { lastName }',
-  'toUser { lastNamePrefix }',
-  'toUser { initials }',
-  'toUser { birthDate }',
-  'toUser { emailAddress }',
-  'toUser { businessEmailAddress }',
-  'toUser { mobileNumber }',
-  'toUser { mobileNumberBusiness }',
-  'toUser { phoneNumber }',
-  'toUser { homePostalCode }',
-  'toUser { homeCity }',
-  'toUser { emailAddresses { emailAddress } }',
-];
-
-async function probeOne(token, snippet) {
-  const query = `query ($p: Pageable) { ${CONFIG.queryName}(qualifier: "deleted=0", pageable: $p) { items { _id ${snippet} } } }`;
-  try { await gql(token, query, { p: { page: 0, size: 1 } }); return { snippet, ok: true }; }
-  catch (e) { return { snippet, ok: false, error: e.message.slice(0, 220) }; }
-}
-
-async function probeAll(token) {
-  const basics = {};
-  const tryQ = async (label, query) => {
-    try { await gql(token, query, { p: { page: 0, size: 1 } }); basics[label] = 'ok'; }
-    catch (e) { basics[label] = 'ERROR: ' + e.message.slice(0, 220); }
-  };
-  await tryQ('id_only_with_qualifier', `query ($p: Pageable){ ${CONFIG.queryName}(qualifier:"deleted=0", pageable:$p){ items { _id } } }`);
-  await tryQ('id_only_no_qualifier', `query ($p: Pageable){ ${CONFIG.queryName}(pageable:$p){ items { _id } } }`);
-
-  // Probe fields with limited concurrency
-  const queue = [...PROBE_SNIPPETS];
-  const results = [];
-  const worker = async () => { while (queue.length) { results.push(await probeOne(token, queue.shift())); } };
-  await Promise.all([worker(), worker(), worker()]);
-
-  return {
-    basics,
-    validFields: results.filter((r) => r.ok).map((r) => r.snippet),
-    invalidFields: results.filter((r) => !r.ok).map((r) => ({ field: r.snippet, error: r.error })),
-  };
+// Best-effort total count for the progress percentage (field may not exist).
+async function detectTotal(token, qualifier) {
+  for (const f of ['totalElements', 'totalCount', 'total']) {
+    try {
+      const q = `query ($qualifier:String,$p:Pageable){ ${CONFIG.queryName}(qualifier:$qualifier,pageable:$p){ ${f} } }`;
+      const d = await gql(token, q, { qualifier, p: { page: 0, size: 1 } });
+      const v = d?.[CONFIG.queryName]?.[f];
+      if (typeof v === 'number' && v > 0) return v;
+    } catch { /* try next */ }
+  }
+  return null;
 }
 
 /* ─── Normalization ─────────────────────────────────────────────────────────*/
@@ -227,17 +178,14 @@ function normEmail(e) { if (!e) return ''; const s = String(e).trim().toLowerCas
 function normPhone(p) {
   if (!p) return '';
   let d = String(p).replace(/[^\d+]/g, '').replace(/^00/, '').replace(/^\+/, '');
-  if (d.charAt(0) === '0') d = '31' + d.substring(1); // NL: 06.. -> 316..
+  if (d.charAt(0) === '0') d = '31' + d.substring(1);
   return d.length >= 6 ? d : '';
 }
 function normName(s) { return s ? stripDiacritics(String(s).toLowerCase()).replace(/[^a-z0-9]/g, '') : ''; }
 function normPostal(s) { return s ? String(s).toUpperCase().replace(/\s+/g, '') : ''; }
 function normBirth(s) { if (!s) return ''; const d = new Date(s); return isNaN(d) ? String(s).slice(0, 10) : d.toISOString().slice(0, 10); }
 
-/* ─── Build normalized rows ────────────────────────────────────────────────*/
 function toRow(c, i) {
-  const emails = [...new Set(CONFIG.getEmails(c).map(normEmail).filter(Boolean))];
-  const phones = [...new Set(CONFIG.getPhones(c).map(normPhone).filter(Boolean))];
   return {
     i,
     id: CONFIG.getId(c),
@@ -248,9 +196,10 @@ function toRow(c, i) {
     birth: CONFIG.getBirth(c) || '',
     postal: CONFIG.getPostal(c) || '',
     city: CONFIG.getCity(c) || '',
+    status: CONFIG.getStatus(c) || '',
     created: CONFIG.getCreated(c) || '',
-    emails, phones,
-    // normalized keys
+    emails: [...new Set(CONFIG.getEmails(c).map(normEmail).filter(Boolean))],
+    phones: [...new Set(CONFIG.getPhones(c).map(normPhone).filter(Boolean))],
     nFirst: normName(CONFIG.getFirstName(c)),
     nLast: normName(CONFIG.getLastName(c)),
     nInitials: normName(CONFIG.getInitials(c)),
@@ -259,15 +208,11 @@ function toRow(c, i) {
   };
 }
 
-/* ─── Score a pair ─────────────────────────────────────────────────────────
- * Returns { score, fields[], level } — level is High / Medium / Low.
- * ==========================================================================*/
+/* ─── Scoring ───────────────────────────────────────────────────────────────*/
 const WEIGHTS = { email: 6, phone: 5, birth: 3, lastName: 2, firstName: 2, initials: 1, postal: 1 };
-
 function scorePair(a, b) {
   const fields = [];
   const shareAny = (x, y) => x.some((v) => y.includes(v));
-
   if (a.emails.length && shareAny(a.emails, b.emails)) fields.push('email');
   if (a.phones.length && shareAny(a.phones, b.phones)) fields.push('phone');
   if (a.nBirth && a.nBirth === b.nBirth) fields.push('birth');
@@ -275,51 +220,28 @@ function scorePair(a, b) {
   if (a.nFirst && a.nFirst === b.nFirst) fields.push('firstName');
   if (a.nInitials && a.nInitials === b.nInitials) fields.push('initials');
   if (a.nPostal && a.nPostal === b.nPostal) fields.push('postal');
-
   const score = fields.reduce((n, f) => n + (WEIGHTS[f] || 0), 0);
   const has = (k) => fields.includes(k);
-
   let level = 'Low';
-  if (has('email') ||
-      (has('phone') && (has('lastName') || has('firstName'))) ||
-      (has('lastName') && has('firstName') && has('birth'))) {
-    level = 'High';
-  } else if (has('phone') ||
-      (has('lastName') && has('firstName')) ||
-      (has('lastName') && has('birth'))) {
-    level = 'Medium';
-  }
+  if (has('email') || (has('phone') && (has('lastName') || has('firstName'))) || (has('lastName') && has('firstName') && has('birth'))) level = 'High';
+  else if (has('phone') || (has('lastName') && has('firstName')) || (has('lastName') && has('birth'))) level = 'Medium';
   return { score, fields, level };
 }
 
-/* ─── Find duplicate pairs via blocking (avoids O(n^2)) ────────────────────*/
-// A normalized value shared by more than this many candidates is treated as a
-// placeholder (e.g. an agency e-mail, a 000.. phone, a default birth date) and
-// is NOT used as a match signal — it would otherwise create thousands of false
-// pairs. Raise it if your data legitimately has large duplicate clusters.
-const MAX_BLOCK = 25;
-
 function findPairs(rows, minLevel) {
-  // Frequency of each normalized e-mail / phone across all candidates
-  const emailFreq = new Map();
-  const phoneFreq = new Map();
+  const emailFreq = new Map(), phoneFreq = new Map();
   const bump = (m, k) => m.set(k, (m.get(k) || 0) + 1);
   rows.forEach((r) => { r.emails.forEach((e) => bump(emailFreq, e)); r.phones.forEach((p) => bump(phoneFreq, p)); });
-
-  // Drop placeholder values from each row so they never count as a match
-  const commonEmail = (e) => (emailFreq.get(e) || 0) > MAX_BLOCK;
-  const commonPhone = (p) => (phoneFreq.get(p) || 0) > MAX_BLOCK;
   let suppressedValues = 0;
   emailFreq.forEach((n) => { if (n > MAX_BLOCK) suppressedValues++; });
   phoneFreq.forEach((n) => { if (n > MAX_BLOCK) suppressedValues++; });
   rows.forEach((r) => {
-    r.emails = r.emails.filter((e) => !commonEmail(e));
-    r.phones = r.phones.filter((p) => !commonPhone(p));
+    r.emails = r.emails.filter((e) => (emailFreq.get(e) || 0) <= MAX_BLOCK);
+    r.phones = r.phones.filter((p) => (phoneFreq.get(p) || 0) <= MAX_BLOCK);
   });
 
   const buckets = new Map();
   const add = (key, i) => { if (!key) return; if (!buckets.has(key)) buckets.set(key, []); buckets.get(key).push(i); };
-
   rows.forEach((r) => {
     r.emails.forEach((e) => add('e:' + e, r.i));
     r.phones.forEach((p) => add('p:' + p, r.i));
@@ -329,14 +251,13 @@ function findPairs(rows, minLevel) {
   });
 
   const rank = { Low: 0, Medium: 1, High: 2 };
-  const minRank = rank[minLevel] ?? 1;
+  const minRank = rank[minLevel] ?? 2;
   const seen = new Set();
   const pairs = [];
   let suppressedBuckets = 0;
-
   for (const idxs of buckets.values()) {
     if (idxs.length < 2) continue;
-    if (idxs.length > MAX_BLOCK) { suppressedBuckets++; continue; } // too big -> placeholder-ish
+    if (idxs.length > MAX_BLOCK) { suppressedBuckets++; continue; }
     for (let x = 0; x < idxs.length; x++) {
       for (let y = x + 1; y < idxs.length; y++) {
         const i = idxs[x], j = idxs[y];
@@ -345,27 +266,19 @@ function findPairs(rows, minLevel) {
         seen.add(key);
         const res = scorePair(rows[i], rows[j]);
         if ((rank[res.level] ?? 0) < minRank) continue;
-        // oldest left, newest right
-        const [older, newer] = String(rows[i].created).localeCompare(String(rows[j].created)) <= 0
-          ? [rows[i], rows[j]] : [rows[j], rows[i]];
+        const [older, newer] = String(rows[i].created).localeCompare(String(rows[j].created)) <= 0 ? [rows[i], rows[j]] : [rows[j], rows[i]];
         pairs.push({ older, newer, ...res });
       }
     }
   }
-
   pairs.sort((a, b) => (rank[b.level] - rank[a.level]) || (b.score - a.score));
   return { pairs, suppressedValues, suppressedBuckets };
 }
 
-/* ─── HTML rendering ────────────────────────────────────────────────────────*/
+/* ─── Rendering ─────────────────────────────────────────────────────────────*/
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
 function fmtDate(s) { if (!s) return '-'; const d = new Date(s); return isNaN(d) ? esc(s) : `${String(d.getUTCDate()).padStart(2, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${d.getUTCFullYear()}`; }
-
-function candidateLink(id) {
-  const base = process.env.CARERIX_APP_BASE || 'https://ab2pro.carerix.net';
-  if (!base || id == null) return null;
-  return base.replace(/\/$/, '') + CANDIDATE_URL_PATH.replace('{id}', encodeURIComponent(id));
-}
+function candidateLink(id) { return id == null ? null : APP_BASE + CANDIDATE_URL_PATH.replace('{id}', encodeURIComponent(id)); }
 
 const FIELD_LABEL = { email: 'Same e-mail', phone: 'Same phone', birth: 'Same birth date', lastName: 'Same last name', firstName: 'Same first name', initials: 'Same initials', postal: 'Same postal code' };
 
@@ -383,6 +296,7 @@ function personCol(p, side) {
         <dt>Birth date</dt><dd>${fmtDate(p.birth)}</dd>
         <dt>Initials</dt><dd>${esc(p.initials) || '-'}</dd>
         <dt>Postal</dt><dd>${esc([p.postal, p.city].filter(Boolean).join(' ')) || '-'}</dd>
+        <dt>Status</dt><dd>${esc(p.status) || '-'}</dd>
         <dt>Created</dt><dd>${fmtDate(p.created)}</dd>
         <dt>ID</dt><dd>#${esc(p.id)}</dd>
       </dl>
@@ -390,7 +304,7 @@ function personCol(p, side) {
     </div>`;
 }
 
-function renderDashboard(pairs, stats) {
+function renderResultsFragment(pairs, stats) {
   const levelClass = { High: 'lv-high', Medium: 'lv-med', Low: 'lv-low' };
   const pairsHtml = pairs.map((pr) => {
     const chips = pr.fields.map((f) => `<span class="chip">${FIELD_LABEL[f] || f}</span>`).join('');
@@ -400,23 +314,41 @@ function renderDashboard(pairs, stats) {
           <span class="level ${levelClass[pr.level]}">${pr.level} match</span>
           <span class="chips">${chips}</span>
         </div>
-        <div class="cols">
-          ${personCol(pr.older, 'older')}
-          ${personCol(pr.newer, 'newer')}
-        </div>
+        <div class="cols">${personCol(pr.older, 'older')}${personCol(pr.newer, 'newer')}</div>
       </div>`;
   }).join('') || '<div class="empty">No likely duplicate pairs found.</div>';
 
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Duplicate Candidates</title>
-<style>
+  const notes = [];
+  if (stats.capped) notes.push(`Limited to the first ${MAX_CANDIDATES} candidates (page size ${PAGE_SIZE}).`);
+  if (stats.suppressedValues || stats.suppressedBuckets) notes.push(`Ignored ${stats.suppressedValues} shared e-mail/phone value(s) and ${stats.suppressedBuckets} oversized group(s) — shared by more than ${MAX_BLOCK} candidates, treated as placeholders to avoid false matches.`);
+  const note = notes.length ? `<p class="note">${notes.map(esc).join('<br>')}</p>` : '';
+
+  return `
+    <div class="toolbar">
+      <button class="btn" onclick="location.reload()">&#8635; Refresh / opnieuw zoeken</button>
+      <span class="toolbar-hint">Run again after merging or archiving candidates.</span>
+    </div>
+    <div class="summary-bar">
+      <div class="stat"><div class="num">${pairs.length}</div><div class="lbl">candidate pairs</div></div>
+      <div class="stat"><div class="num">${pairs.filter((p) => p.level === 'High').length}</div><div class="lbl">high confidence</div></div>
+      <div class="stat"><div class="num">${stats.scanned}</div><div class="lbl">candidates scanned</div></div>
+    </div>
+    ${note}
+    <div class="searchbar"><input type="search" id="q" placeholder="Search name, e-mail, phone or ID..." autocomplete="off"/><span id="qc"></span></div>
+    <div id="results">${pairsHtml}</div>`;
+}
+
+const PAGE_STYLES = `
   :root { --cx-accent:#2f6fb2; }
   * { box-sizing:border-box; }
   body { font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#24292f; background:#f6f8fa; margin:0; padding:24px; }
   h1 { color:var(--cx-accent); font-size:22px; margin:0 0 4px; }
   .subtitle { color:#57606a; margin:0 0 18px; font-size:13px; }
   .note { background:#fff8c5; border:1px solid #eac54f; border-radius:8px; padding:10px 14px; font-size:13px; color:#57606a; margin:0 0 16px; }
+  .toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin:0 0 16px; }
+  .btn { background:var(--cx-accent); color:#fff; border:none; border-radius:8px; padding:9px 16px; font-size:14px; cursor:pointer; }
+  .btn:hover { background:#255a91; }
+  .toolbar-hint { font-size:12px; color:#8c959f; }
   .summary-bar { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 20px; }
   .stat { background:#fff; border:1px solid #d0d7de; border-radius:8px; padding:12px 16px; min-width:150px; }
   .stat .num { font-size:26px; font-weight:700; color:var(--cx-accent); line-height:1; }
@@ -445,48 +377,78 @@ function renderDashboard(pairs, stats) {
   dt { color:#8c959f; }
   dd { margin:0; word-break:break-word; }
   .empty { background:#fff; border:1px dashed #d0d7de; border-radius:8px; padding:24px; text-align:center; color:#57606a; }
-  @media print { body { background:#fff; padding:0; } .searchbar { display:none; } .pair { break-inside:avoid; } }
-</style></head><body>
+  .loader { max-width:560px; margin:8px 0 24px; }
+  .lbar { background:#eaeef2; border-radius:8px; height:16px; overflow:hidden; }
+  .lfill { height:100%; width:0; background:var(--cx-accent); border-radius:8px; transition:width .3s ease; }
+  .lfill.indet { width:100%; background:linear-gradient(90deg,#e6eef7 25%,#2f6fb2 50%,#e6eef7 75%); background-size:200% 100%; animation:indet 1.2s linear infinite; }
+  @keyframes indet { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+  .lstatus { margin-top:10px; font-size:14px; color:#24292f; }
+  .lsteps { margin-top:6px; font-size:12px; color:#8c959f; }
+  .lsteps .on { color:var(--cx-accent); font-weight:600; }
+  @media print { body { background:#fff; padding:0; } .searchbar,.loader { display:none; } .pair { break-inside:avoid; } }`;
+
+const LOADER_JS = `
+(function(){
+  var fill=document.getElementById('fill'), st=document.getElementById('lstatus');
+  var s1=document.getElementById('s1'), s2=document.getElementById('s2'), done=false;
+  var params=new URLSearchParams(window.location.search); params.set('stream','1');
+  var es=new EventSource('/api/duplicates?'+params.toString());
+  function setFill(p){ fill.className='lfill'; fill.style.width=p+'%'; }
+  function setIndet(){ if(fill.className.indexOf('indet')<0){ fill.className='lfill indet'; } }
+  es.addEventListener('progress',function(e){
+    var d=JSON.parse(e.data);
+    if(d.phase==='fetch'){
+      if(d.total){ var p=Math.min(99,Math.round(d.fetched/d.total*100)); setFill(p);
+        st.textContent=d.fetched.toLocaleString()+' / '+d.total.toLocaleString()+' kandidaten opgehaald ('+p+'%)'; }
+      else { setIndet(); st.textContent=d.fetched.toLocaleString()+' kandidaten opgehaald…'; }
+    } else if(d.phase==='compute'){
+      if(s1)s1.className=''; if(s2)s2.className='on'; setFill(99); st.textContent='Duplicaten berekenen…';
+    }
+  });
+  es.addEventListener('done',function(e){
+    done=true; es.close(); var d=JSON.parse(e.data); setFill(100);
+    document.getElementById('app').innerHTML=d.fragment;
+    var ld=document.getElementById('loader'); if(ld&&ld.parentNode)ld.parentNode.removeChild(ld);
+    initSearch();
+  });
+  es.addEventListener('fail',function(e){
+    done=true; es.close(); var d=JSON.parse(e.data);
+    st.textContent='Fout: '+(d.message||'onbekend'); fill.className='lfill'; fill.style.width='100%'; fill.style.background='#d1242f';
+  });
+  es.onerror=function(){ if(done)return; es.close(); st.textContent='Verbinding onderbroken — vernieuw de pagina om opnieuw te proberen.'; };
+  function initSearch(){
+    var box=document.getElementById('q'), info=document.getElementById('qc'), it=document.querySelectorAll('.pair');
+    if(!box)return;
+    box.addEventListener('input',function(){
+      var q=box.value.toLowerCase().trim(),shown=0;
+      for(var i=0;i<it.length;i++){var hit=!q||it[i].textContent.toLowerCase().indexOf(q)>=0;it[i].style.display=hit?'':'none';if(hit)shown++;}
+      info.textContent=q?(shown+' pair'+(shown===1?'':'s')+' shown'):'';
+    });
+  }
+})();`;
+
+function renderLoaderPage() {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Duplicate Candidates</title>
+<style>${PAGE_STYLES}</style></head><body>
   <h1>Duplicate Candidates</h1>
-  <p class="subtitle">High-confidence one-on-one matches &middot; oldest on the left, newest on the right &middot; add <code>?min=medium</code> to the URL to also see weaker matches</p>
-  <div class="summary-bar">
-    <div class="stat"><div class="num">${pairs.length}</div><div class="lbl">candidate pairs</div></div>
-    <div class="stat"><div class="num">${pairs.filter((p) => p.level === 'High').length}</div><div class="lbl">high confidence</div></div>
-    <div class="stat"><div class="num">${stats.scanned}</div><div class="lbl">candidates scanned</div></div>
+  <p class="subtitle">High-confidence one-on-one matches &middot; oldest on the left, newest on the right &middot; add <code>?min=medium</code> for weaker matches</p>
+  <div id="loader" class="loader">
+    <div class="lbar"><div id="fill" class="lfill"></div></div>
+    <div id="lstatus" class="lstatus">Verbinden met Carerix…</div>
+    <div class="lsteps"><span id="s1" class="on">1. Kandidaten ophalen</span> &nbsp;&rarr;&nbsp; <span id="s2">2. Duplicaten berekenen</span></div>
   </div>
-  ${(stats.suppressedValues || stats.suppressedBuckets) ? `<p class="note">Ignored ${stats.suppressedValues} shared e-mail/phone value(s) and ${stats.suppressedBuckets} oversized group(s) — each shared by more than ${MAX_BLOCK} candidates, so treated as placeholders (agency e-mail, 000… phone, default birth date) to avoid false matches.</p>` : ''}
-  <div class="searchbar">
-    <input type="search" id="q" placeholder="Search name, e-mail, phone or ID..." autocomplete="off"/>
-    <span id="qc"></span>
-  </div>
-  <div id="results">${pairsHtml}</div>
-  <script>
-    (function(){
-      var box=document.getElementById('q'),info=document.getElementById('qc'),it=document.querySelectorAll('.pair');
-      if(!box)return;
-      box.addEventListener('input',function(){
-        var q=box.value.toLowerCase().trim(),shown=0;
-        for(var i=0;i<it.length;i++){var hit=!q||it[i].textContent.toLowerCase().indexOf(q)>=0;it[i].style.display=hit?'':'none';if(hit)shown++;}
-        info.textContent=q?(shown+' pair'+(shown===1?'':'s')+' shown'):'';
-      });
-    })();
-  </script>
+  <div id="app"></div>
+  <script>${LOADER_JS}</script>
 </body></html>`;
 }
 
 function renderError(err, extra) {
   const gqlBlock = err.graphqlErrors ? `<pre>${esc(JSON.stringify(err.graphqlErrors, null, 2))}</pre>` : '';
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Duplicate Candidates — error</title>
-<style>body{font-family:-apple-system,"Segoe UI",Roboto,Arial,sans-serif;padding:24px;color:#24292f}pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:14px;overflow:auto;font-size:13px}h1{color:#d1242f;font-size:20px}code{background:#f6f8fa;padding:1px 5px;border-radius:4px}</style>
-</head><body>
-  <h1>Could not build the dashboard</h1>
-  <p>${esc(err.message)}</p>
-  ${gqlBlock}
-  <p>Most likely a field name in <code>CONFIG</code> doesn't match your schema. Run
-     <code>?debug=schema</code> to see the real candidate/user fields, then adjust
-     <code>CONFIG.queryName</code> / <code>CONFIG.itemSelection</code> in <code>api/duplicates.js</code>.</p>
-  ${extra || ''}
-</body></html>`;
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"/><title>Error</title>
+<style>body{font-family:-apple-system,Arial,sans-serif;padding:24px;color:#24292f}pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:8px;padding:14px;overflow:auto;font-size:13px}h1{color:#d1242f;font-size:20px}</style>
+</head><body><h1>Could not build the dashboard</h1><p>${esc(err.message)}</p>${gqlBlock}${extra || ''}</body></html>`;
 }
 
 /* ─── Handler ───────────────────────────────────────────────────────────────*/
@@ -494,45 +456,71 @@ export default async function handler(req, res) {
   const url = new URL(req.url, `http://${req.headers?.host || 'localhost'}`);
   const q = (k) => req.query?.[k] || url.searchParams.get(k);
   const debug = q('debug');
+  const stream = q('stream');
   const scope = q('scope');
   const ownerId = q('ownerId');
   const minRaw = (q('min') || 'high').toLowerCase();
   const min = minRaw === 'low' ? 'Low' : minRaw === 'medium' ? 'Medium' : 'High';
 
-  try {
-    const token = await getAccessToken();
+  // deleted = merged/removed; anonymized = GDPR-removed. Both excluded.
+  let qualifier = 'deleted = 0 and anonymized = 0';
+  if (scope === 'owner' && ownerId) qualifier += ` and ownerID = ${Number(ownerId)}`;
 
-    if (debug === 'schema') {
+  // Debug modes → JSON
+  if (debug) {
+    try {
+      const token = await getAccessToken();
+      let out;
+      if (debug === 'schema') out = await introspect(token);
+      else if (debug === 'probe') out = await probeAll(token);
+      else if (debug === 'raw') out = (await fetchCandidates(token, qualifier, 1)).slice(0, 1);
+      else out = { error: 'unknown debug mode' };
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.status(200).send(JSON.stringify(await introspect(token), null, 2));
-    }
-    if (debug === 'probe') {
+      return res.status(200).send(JSON.stringify(out, null, 2));
+    } catch (err) {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.status(200).send(JSON.stringify(await probeAll(token), null, 2));
+      return res.status(500).send(JSON.stringify({ error: err.message, graphqlErrors: err.graphqlErrors }, null, 2));
     }
-    if (debug === 'raw') {
-      const one = await fetchCandidates(token, 'deleted=0', 1);
-      res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      return res.status(200).send(JSON.stringify(one.slice(0, 1), null, 2));
-    }
-
-    let qualifier = 'deleted=0';
-    if (scope === 'owner' && ownerId) qualifier += ` and toUser.owner.userID = ${Number(ownerId)}`;
-
-    const candidates = await fetchCandidates(token, qualifier);
-    const rows = candidates.map(toRow);
-    const { pairs, suppressedValues, suppressedBuckets } = findPairs(rows, min);
-
-    const html = renderDashboard(pairs, { scanned: candidates.length, suppressedValues, suppressedBuckets });
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
-    return res.status(200).send(html);
-  } catch (err) {
-    let extra = '';
-    if (debug !== 'schema') {
-      try { extra = `<h2>Live schema (candidate/user types)</h2><pre>${esc(JSON.stringify(await introspect(await getAccessToken()), null, 2))}</pre>`; } catch { /* ignore */ }
-    }
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.status(500).send(renderError(err, extra));
   }
+
+  // SSE stream → progress events + final results fragment
+  if (stream) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    const send = (event, data) => res.write('event: ' + event + '\n' + 'data: ' + JSON.stringify(data) + '\n\n');
+    try {
+      const token = await getAccessToken();
+      const total = await detectTotal(token, qualifier);
+      const cap = Math.min(total || MAX_CANDIDATES, MAX_CANDIDATES);
+      send('progress', { phase: 'fetch', fetched: 0, total: cap });
+      let all = [], page = 0;
+      while (true) {
+        const items = await fetchPage(token, qualifier, page);
+        all = all.concat(items);
+        send('progress', { phase: 'fetch', fetched: Math.min(all.length, MAX_CANDIDATES), total: cap, page });
+        if (items.length < PAGE_SIZE) break;
+        if (all.length >= MAX_CANDIDATES) break;
+        page++;
+      }
+      all = all.slice(0, MAX_CANDIDATES);
+      send('progress', { phase: 'compute', fetched: all.length, total: cap });
+      const rows = all.map(toRow);
+      const { pairs, suppressedValues, suppressedBuckets } = findPairs(rows, min);
+      const capped = all.length >= MAX_CANDIDATES;
+      const fragment = renderResultsFragment(pairs, { scanned: all.length, suppressedValues, suppressedBuckets, capped });
+      send('done', { fragment });
+      return res.end();
+    } catch (err) {
+      send('fail', { message: err.message });
+      return res.end();
+    }
+  }
+
+  // Default → loader page (static, instant)
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  return res.status(200).send(renderLoaderPage());
 }
