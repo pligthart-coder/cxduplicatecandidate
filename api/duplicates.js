@@ -328,7 +328,7 @@ function renderResultsFragment(pairs, stats) {
 
   return `
     <div class="toolbar">
-      <button class="btn" onclick="location.reload()">&#8635; Refresh / opnieuw zoeken</button>
+      <button class="btn" onclick="location.reload()">&#8635; Refresh</button>
       <span class="toolbar-hint">Run again after merging or archiving candidates.</span>
     </div>
     <div class="summary-bar">
@@ -403,12 +403,12 @@ const LOADER_JS = `
     if(d.phase==='fetch'){
       var base;
       if(d.total){ var p=Math.min(99,Math.round(d.fetched/d.total*100)); setFill(p);
-        base=d.fetched.toLocaleString()+' / '+d.total.toLocaleString()+' kandidaten ('+p+'%)'; }
-      else { setIndet(); base=d.fetched.toLocaleString()+' kandidaten opgehaald…'; }
-      if(d.pairs){ base+=' · '+d.pairs.toLocaleString()+' duplicaten gevonden'; }
+        base=d.fetched.toLocaleString()+' / '+d.total.toLocaleString()+' candidates ('+p+'%)'; }
+      else { setIndet(); base=d.fetched.toLocaleString()+' candidates fetched…'; }
+      if(d.pairs){ base+=' · '+d.pairs.toLocaleString()+' duplicates found'; }
       st.textContent=base;
     } else if(d.phase==='compute'){
-      if(s1)s1.className=''; if(s2)s2.className='on'; setFill(99); st.textContent='Duplicaten berekenen…';
+      if(s1)s1.className=''; if(s2)s2.className='on'; setFill(99); st.textContent='Finding duplicates…';
     }
   });
   es.addEventListener('done',function(e){
@@ -419,9 +419,9 @@ const LOADER_JS = `
   });
   es.addEventListener('fail',function(e){
     done=true; es.close(); var d=JSON.parse(e.data);
-    st.textContent='Fout: '+(d.message||'onbekend'); fill.className='lfill'; fill.style.width='100%'; fill.style.background='#d1242f';
+    st.textContent='Error: '+(d.message||'unknown'); fill.className='lfill'; fill.style.width='100%'; fill.style.background='#d1242f';
   });
-  es.onerror=function(){ if(done)return; es.close(); st.textContent='Verbinding onderbroken — vernieuw de pagina om opnieuw te proberen.'; };
+  es.onerror=function(){ if(done)return; es.close(); st.textContent='Connection interrupted — refresh the page to try again.'; };
   function initSearch(){
     var box=document.getElementById('q'), info=document.getElementById('qc'), it=document.querySelectorAll('.pair');
     if(!box)return;
@@ -442,8 +442,8 @@ function renderLoaderPage() {
   <p class="subtitle">High-confidence one-on-one matches &middot; oldest on the left, newest on the right &middot; add <code>?min=medium</code> for weaker matches</p>
   <div id="loader" class="loader">
     <div class="lbar"><div id="fill" class="lfill"></div></div>
-    <div id="lstatus" class="lstatus">Verbinden met Carerix…</div>
-    <div class="lsteps"><span id="s1" class="on">1. Kandidaten ophalen</span> &nbsp;&rarr;&nbsp; <span id="s2">2. Duplicaten berekenen</span></div>
+    <div id="lstatus" class="lstatus">Connecting to Carerix…</div>
+    <div class="lsteps"><span id="s1" class="on">1. Fetching candidates</span> &nbsp;&rarr;&nbsp; <span id="s2">2. Finding duplicates</span></div>
   </div>
   <div id="app"></div>
   <script>${LOADER_JS}</script>
