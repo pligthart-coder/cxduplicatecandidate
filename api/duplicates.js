@@ -69,9 +69,9 @@ const CONFIG = {
 };
 
 // Link to open a candidate in Carerix. {id} is replaced with the employeeID.
-// Requires the CARERIX_APP_BASE env var (e.g. https://yourcompany.carerix.com).
-// Adjust the path here if this default doesn't open the candidate record.
-const CANDIDATE_URL_PATH = '/main?searchEntityName=CREmployee&id={id}';
+// Requires the CARERIX_APP_BASE env var (e.g. https://ab2pro.carerix.net).
+// Carerix uses hash routing: https://<company>.carerix.net/#CREmployee/<id>
+const CANDIDATE_URL_PATH = '/#CREmployee/{id}';
 
 /* ─── OAuth2 ───────────────────────────────────────────────────────────────*/
 async function getAccessToken() {
@@ -293,7 +293,30 @@ function scorePair(a, b) {
 }
 
 /* ─── Find duplicate pairs via blocking (avoids O(n^2)) ────────────────────*/
+// A normalized value shared by more than this many candidates is treated as a
+// placeholder (e.g. an agency e-mail, a 000.. phone, a default birth date) and
+// is NOT used as a match signal — it would otherwise create thousands of false
+// pairs. Raise it if your data legitimately has large duplicate clusters.
+const MAX_BLOCK = 25;
+
 function findPairs(rows, minLevel) {
+  // Frequency of each normalized e-mail / phone across all candidates
+  const emailFreq = new Map();
+  const phoneFreq = new Map();
+  const bump = (m, k) => m.set(k, (m.get(k) || 0) + 1);
+  rows.forEach((r) => { r.emails.forEach((e) => bump(emailFreq, e)); r.phones.forEach((p) => bump(phoneFreq, p)); });
+
+  // Drop placeholder values from each row so they never count as a match
+  const commonEmail = (e) => (emailFreq.get(e) || 0) > MAX_BLOCK;
+  const commonPhone = (p) => (phoneFreq.get(p) || 0) > MAX_BLOCK;
+  let suppressedValues = 0;
+  emailFreq.forEach((n) => { if (n > MAX_BLOCK) suppressedValues++; });
+  phoneFreq.forEach((n) => { if (n > MAX_BLOCK) suppressedValues++; });
+  rows.forEach((r) => {
+    r.emails = r.emails.filter((e) => !commonEmail(e));
+    r.phones = r.phones.filter((p) => !commonPhone(p));
+  });
+
   const buckets = new Map();
   const add = (key, i) => { if (!key) return; if (!buckets.has(key)) buckets.set(key, []); buckets.get(key).push(i); };
 
@@ -309,9 +332,11 @@ function findPairs(rows, minLevel) {
   const minRank = rank[minLevel] ?? 1;
   const seen = new Set();
   const pairs = [];
+  let suppressedBuckets = 0;
 
   for (const idxs of buckets.values()) {
     if (idxs.length < 2) continue;
+    if (idxs.length > MAX_BLOCK) { suppressedBuckets++; continue; } // too big -> placeholder-ish
     for (let x = 0; x < idxs.length; x++) {
       for (let y = x + 1; y < idxs.length; y++) {
         const i = idxs[x], j = idxs[y];
@@ -329,7 +354,7 @@ function findPairs(rows, minLevel) {
   }
 
   pairs.sort((a, b) => (rank[b.level] - rank[a.level]) || (b.score - a.score));
-  return pairs;
+  return { pairs, suppressedValues, suppressedBuckets };
 }
 
 /* ─── HTML rendering ────────────────────────────────────────────────────────*/
@@ -337,7 +362,7 @@ function esc(s) { return String(s ?? '').replace(/[&<>"]/g, (m) => ({ '&': '&amp
 function fmtDate(s) { if (!s) return '-'; const d = new Date(s); return isNaN(d) ? esc(s) : `${String(d.getUTCDate()).padStart(2, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${d.getUTCFullYear()}`; }
 
 function candidateLink(id) {
-  const base = process.env.CARERIX_APP_BASE;
+  const base = process.env.CARERIX_APP_BASE || 'https://ab2pro.carerix.net';
   if (!base || id == null) return null;
   return base.replace(/\/$/, '') + CANDIDATE_URL_PATH.replace('{id}', encodeURIComponent(id));
 }
@@ -391,6 +416,7 @@ function renderDashboard(pairs, stats) {
   body { font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; color:#24292f; background:#f6f8fa; margin:0; padding:24px; }
   h1 { color:var(--cx-accent); font-size:22px; margin:0 0 4px; }
   .subtitle { color:#57606a; margin:0 0 18px; font-size:13px; }
+  .note { background:#fff8c5; border:1px solid #eac54f; border-radius:8px; padding:10px 14px; font-size:13px; color:#57606a; margin:0 0 16px; }
   .summary-bar { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 20px; }
   .stat { background:#fff; border:1px solid #d0d7de; border-radius:8px; padding:12px 16px; min-width:150px; }
   .stat .num { font-size:26px; font-weight:700; color:var(--cx-accent); line-height:1; }
@@ -428,6 +454,7 @@ function renderDashboard(pairs, stats) {
     <div class="stat"><div class="num">${pairs.filter((p) => p.level === 'High').length}</div><div class="lbl">high confidence</div></div>
     <div class="stat"><div class="num">${stats.scanned}</div><div class="lbl">candidates scanned</div></div>
   </div>
+  ${(stats.suppressedValues || stats.suppressedBuckets) ? `<p class="note">Ignored ${stats.suppressedValues} shared e-mail/phone value(s) and ${stats.suppressedBuckets} oversized group(s) — each shared by more than ${MAX_BLOCK} candidates, so treated as placeholders (agency e-mail, 000… phone, default birth date) to avoid false matches.</p>` : ''}
   <div class="searchbar">
     <input type="search" id="q" placeholder="Search name, e-mail, phone or ID..." autocomplete="off"/>
     <span id="qc"></span>
@@ -494,9 +521,9 @@ export default async function handler(req, res) {
 
     const candidates = await fetchCandidates(token, qualifier);
     const rows = candidates.map(toRow);
-    const pairs = findPairs(rows, min);
+    const { pairs, suppressedValues, suppressedBuckets } = findPairs(rows, min);
 
-    const html = renderDashboard(pairs, { scanned: candidates.length });
+    const html = renderDashboard(pairs, { scanned: candidates.length, suppressedValues, suppressedBuckets });
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
     return res.status(200).send(html);
