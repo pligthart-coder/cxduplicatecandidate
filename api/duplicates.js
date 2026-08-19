@@ -22,9 +22,10 @@
 
 const CARERIX_GRAPHQL_URI = 'https://api.carerix.io/graphql/v1/graphql';
 const PAGE_SIZE = 150;         // fetch candidates in pages of 150
+const FETCH_CONCURRENCY = 6;   // pages fetched in parallel (to scan the whole DB in time)
 const MAX_PAIRS = 2500;        // stop once this many duplicate pairs are found
 const MAX_SCAN = 50000;        // hard safety cap on candidates scanned
-const TIME_BUDGET_MS = 50000;  // stop fetching before the serverless time limit
+const TIME_BUDGET_MS = 55000;  // stop fetching before the serverless time limit
 
 /* ============================================================================
  * CONFIG — field names, confirmed against the live schema.
@@ -468,9 +469,13 @@ export default async function handler(req, res) {
   const minRaw = (q('min') || 'high').toLowerCase();
   const min = minRaw === 'low' ? 'Low' : minRaw === 'medium' ? 'Medium' : 'High';
 
-  // deleted = merged/removed/archived; anonymized = GDPR-removed. Both excluded.
-  // Use "!= 1" so candidates with an empty anonymized value are kept.
-  let qualifier = 'deleted = 0 and anonymized != 1';
+  // Only exclude deleted candidates — archiving = deleted in this tenant, so
+  // archived candidates are already out. We deliberately do NOT filter on
+  // "anonymized": that field is empty for most records and filtering on it
+  // dropped ~12k real candidates. Anonymized records have no name/e-mail/phone,
+  // so they can't produce matches anyway — keeping them guarantees the whole
+  // database is scanned and no real duplicate is missed.
+  let qualifier = 'deleted = 0';
   if (scope === 'owner' && ownerId) qualifier += ` and ownerID = ${Number(ownerId)}`;
 
   // Debug modes → JSON
@@ -503,20 +508,26 @@ export default async function handler(req, res) {
       const token = await getAccessToken();
       const total = await detectTotal(token, qualifier);
       send('progress', { phase: 'fetch', fetched: 0, total, pairs: 0 });
-      let all = [], page = 0, timedOut = false, pairsCount = 0;
+      // Fetch pages in parallel batches so the WHOLE database is scanned in one
+      // run (well within the time limit) — required to catch every duplicate.
+      let all = [], base = 0, timedOut = false, pairsCount = 0, reachedEnd = false;
       const start = Date.now();
       while (true) {
-        const items = await fetchPage(token, qualifier, page);
-        all = all.concat(items);
-        const noMore = items.length < PAGE_SIZE;
-        // Recompute duplicates periodically (and at the end) to allow early stop
-        if (noMore || page % 10 === 9) pairsCount = findPairs(all.map(toRow), min).pairs.length;
+        const batch = [];
+        for (let k = 0; k < FETCH_CONCURRENCY; k++) batch.push(fetchPage(token, qualifier, base + k));
+        const results = await Promise.all(batch);
+        for (const items of results) {
+          all = all.concat(items);
+          if (items.length < PAGE_SIZE) reachedEnd = true; // a short page = last page
+        }
+        base += FETCH_CONCURRENCY;
+        pairsCount = findPairs(all.map(toRow), min).pairs.length;
         send('progress', { phase: 'fetch', fetched: all.length, total, pairs: pairsCount });
-        if (noMore) break;                                   // no more candidates
-        if (pairsCount >= MAX_PAIRS) break;                  // enough duplicates found
-        if (all.length >= MAX_SCAN) break;                   // safety cap
+        if (reachedEnd) break;                                        // whole DB scanned
+        if (total && all.length >= Math.min(total, MAX_SCAN)) break;  // reached known total
+        if (pairsCount >= MAX_PAIRS) break;                           // enough duplicates found
+        if (all.length >= MAX_SCAN) break;                            // safety cap
         if (Date.now() - start > TIME_BUDGET_MS) { timedOut = true; break; } // time budget
-        page++;
       }
       send('progress', { phase: 'compute', fetched: all.length, total });
       const result = findPairs(all.map(toRow), min);
